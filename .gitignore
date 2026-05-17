@@ -1,0 +1,11 @@
+.venv/
+.ipynb_checkpoints/
+.idea/
+__pycache__/
+notebooks/__pycache__/
+opos_prediction/
+docs/
+data/
+*.pyc
+*.pyo
+*.pyd
