@@ -1,6 +1,8 @@
+"""
+Shared helper functions for the opossum forecasting notebooks.
+This file keeps the repetitive setup in one place so the notebooks can stay focused on the actual analysis instead of a bunch of copy-pasted wrangling.
+"""
 from __future__ import annotations
-
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -54,14 +56,6 @@ AGE_MAP = {
     "": "unknown",
 }
 
-
-@dataclass(frozen=True)
-class SplitData:
-    train: pd.DataFrame
-    validation: pd.DataFrame
-    test: pd.DataFrame
-
-
 def load_raw_data(path: Path | str = DATA_PATH) -> pd.DataFrame:
     return pd.read_csv(path)
 
@@ -112,13 +106,14 @@ def clean_opossum_data(path: Path | str = DATA_PATH) -> pd.DataFrame:
 def age_focus_data(df: pd.DataFrame, focus_ages: Iterable[str] = FOCUS_AGES) -> pd.DataFrame:
     return df.loc[df["age_group"].isin(tuple(focus_ages))].copy()
 
-
+# Aggregate focused admissions into a daily arrivals time series
 def build_daily_arrivals(
     df: pd.DataFrame,
     focus_ages: Iterable[str] = FOCUS_AGES,
     fill_missing_dates: bool = True,
     end_date: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
+
     focus_df = age_focus_data(df, focus_ages)
     daily = (
         focus_df.groupby("admission_date")
@@ -139,8 +134,9 @@ def build_daily_arrivals(
     daily = daily.reset_index()
     return add_calendar_features(daily)
 
-
+# Add calendar features that help the models pick up seasonality
 def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+
     out = df.copy()
     out["admission_date"] = pd.to_datetime(out["admission_date"])
     us_holidays = holidays.US()
@@ -163,8 +159,9 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
-
+# Create lag and rolling features from the target series
 def add_lag_features(df: pd.DataFrame, target_col: str = "arrivals") -> pd.DataFrame:
+
     out = df.copy()
     for lag in (1, 7, 14, 28):
         out[f"lag_{lag}"] = out[target_col].shift(lag)
@@ -177,50 +174,16 @@ def add_lag_features(df: pd.DataFrame, target_col: str = "arrivals") -> pd.DataF
 
     return out
 
-
-def apply_known_absence_window(
-    df: pd.DataFrame,
-    start_date: str | pd.Timestamp,
-    end_date: str | pd.Timestamp,
-    target_col: str = "arrivals",
-) -> pd.DataFrame:
-    out = df.copy()
-    start_ts = pd.Timestamp(start_date)
-    end_ts = pd.Timestamp(end_date)
-    mask = (pd.to_datetime(out["admission_date"]) >= start_ts) & (
-        pd.to_datetime(out["admission_date"]) <= end_ts
-    )
-    out.loc[mask, target_col] = 0.0
-    return out
-
-
+# Build the feature-ready modeling frame used in several notebooks
 def build_model_frame(
     df: pd.DataFrame,
     focus_ages: Iterable[str] = FOCUS_AGES,
     end_date: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
+
     daily = build_daily_arrivals(df, focus_ages=focus_ages, end_date=end_date)
     model_df = add_lag_features(daily)
     return model_df.dropna().reset_index(drop=True)
-
-
-def split_for_2026_forecast(
-    df: pd.DataFrame,
-    validation_start: str = "2025-01-01",
-    test_start: str = "2026-01-01",
-) -> SplitData:
-    validation_start_ts = pd.Timestamp(validation_start)
-    test_start_ts = pd.Timestamp(test_start)
-
-    train = df.loc[df["admission_date"] < validation_start_ts].copy()
-    validation = df.loc[
-        (df["admission_date"] >= validation_start_ts)
-        & (df["admission_date"] < test_start_ts)
-    ].copy()
-    test = df.loc[df["admission_date"] >= test_start_ts].copy()
-
-    return SplitData(train=train, validation=validation, test=test)
-
 
 def feature_columns(df: pd.DataFrame) -> list[str]:
     exclude = {"admission_date", "arrivals"}
@@ -246,84 +209,16 @@ def evaluate_regression(y_true: pd.Series, y_pred: np.ndarray, model_name: str) 
         "mape": float(mape),
     }
 
-
-def month_day_baseline(train_df: pd.DataFrame, forecast_df: pd.DataFrame) -> np.ndarray:
-    reference = (
-        train_df.assign(month=train_df["admission_date"].dt.month, day=train_df["admission_date"].dt.day)
-        .groupby(["month", "day"])["arrivals"]
-        .mean()
-    )
-    keyed = forecast_df.assign(
-        month=forecast_df["admission_date"].dt.month,
-        day=forecast_df["admission_date"].dt.day,
-    )
-    overall_mean = float(train_df["arrivals"].mean())
-    return (
-        keyed.set_index(["month", "day"]).index.to_series().map(reference).fillna(overall_mean).to_numpy()
-    )
-
-
+# Create the forward-looking date range for a forecast horizon
 def forecast_date_range(
     last_observed_date: str | pd.Timestamp,
     horizon_days: int,
 ) -> pd.DatetimeIndex:
+
     last_observed_ts = pd.Timestamp(last_observed_date)
     if horizon_days <= 0:
         return pd.DatetimeIndex([], dtype="datetime64[ns]")
     return pd.date_range(last_observed_ts + pd.Timedelta(days=1), periods=horizon_days, freq="D")
-
-
-def recursive_forecast(
-    model,
-    history_df: pd.DataFrame,
-    forecast_dates: Iterable[str | pd.Timestamp],
-    features: list[str],
-    target_col: str = "arrivals",
-) -> pd.DataFrame:
-    history = history_df[["admission_date", target_col]].copy()
-    history["admission_date"] = pd.to_datetime(history["admission_date"])
-
-    forecast_rows: list[pd.DataFrame] = []
-    for forecast_date in pd.to_datetime(list(forecast_dates)):
-        candidate = pd.concat(
-            [
-                history,
-                pd.DataFrame({"admission_date": [forecast_date], target_col: [np.nan]}),
-            ],
-            ignore_index=True,
-        )
-        candidate = add_lag_features(add_calendar_features(candidate), target_col=target_col)
-        row = candidate.iloc[[-1]].copy()
-        prediction = float(model.predict(row[features])[0])
-        row[target_col] = prediction
-        history = pd.concat([history, row[["admission_date", target_col]]], ignore_index=True)
-        forecast_rows.append(row)
-
-    if not forecast_rows:
-        empty_cols = ["admission_date", target_col] + features
-        return pd.DataFrame(columns=empty_cols)
-
-    return pd.concat(forecast_rows, ignore_index=True)
-
-
-def zero_before_season_start(
-    df: pd.DataFrame,
-    prediction_cols: Iterable[str],
-    start_month: int = 3,
-    start_day: int = 14,
-    date_col: str = "admission_date",
-) -> pd.DataFrame:
-    out = df.copy()
-    dates = pd.to_datetime(out[date_col])
-    before_season = (dates.dt.month < start_month) | (
-        (dates.dt.month == start_month) & (dates.dt.day < start_day)
-    )
-
-    for column in prediction_cols:
-        out.loc[before_season, column] = 0.0
-
-    return out
-
 
 def save_csv(df: pd.DataFrame, filename: str) -> Path:
     output_path = PROCESSED_DIR / filename
